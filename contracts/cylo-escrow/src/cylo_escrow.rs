@@ -2,8 +2,14 @@
 
 
 use soroban_sdk::{
-    contract, contractevent, contracterror, contractimpl, contracttype, Address,
+    contract, contractevent, contractimpl, contracttype, Address,
     Env, String, Vec,
+};
+use crate::{
+    errors::CyloEscrowErrors, 
+    cylo_escrow_types::{
+        Order, OrderStatus
+    }
 };
 
 use soroban_sdk::token::TokenClient;
@@ -22,42 +28,6 @@ pub enum DataKey {
     Order(u32), 
     BuyerOrders,  
     FarmerOrders, 
-}
-
-// #[contracterror]
-// #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-// pub enum CyloEscrowErrors {
-//     AlreadyInitialized = 1,
-//     NotInitialized = 2,
-//     InvalidOrderId = 3,
-//     Unauthorized = 4,
-//     InvalidInput = 5,
-//     TransferFailed = 6,
-//     AlreadyProcessed = 7,
-//     NotExpired = 8,
-// }
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Order {
-    pub id: u32,
-    pub buyer: Address,
-    pub farmer: Address,
-    pub token: Address,
-    pub amount: i128,
-    pub timestamp: u64,
-    pub confirmed: bool,
-    pub refunded: bool,
-    pub metadata: String,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrderStatus {
-    pub is_confirmed: bool,
-    pub is_refunded: bool,
-    pub is_expired: bool,
-    pub time_remaining: u64,
 }
 
 #[contractevent]
