@@ -1,4 +1,3 @@
-
 use soroban_sdk::{contractevent, Address};
 
 #[contractevent]
