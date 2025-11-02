@@ -2,14 +2,15 @@
 
 
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, Address,
+    contract, contractimpl, contracttype, Address,
     Env, String, Vec,
 };
 use crate::{
     errors::CyloEscrowErrors, 
     cylo_escrow_types::{
         Order, OrderStatus
-    }
+    },
+    events::{*},
 };
 
 use soroban_sdk::token::TokenClient;
@@ -28,38 +29,6 @@ pub enum DataKey {
     Order(u32), 
     BuyerOrders,  
     FarmerOrders, 
-}
-
-#[contractevent]
-pub struct ContractInitialized {
-    #[topic]
-    pub timestamp: u64,
-    #[topic]
-    pub admin: Address,
-}
-
-#[contractevent]
-pub struct OrderCreated {
-    #[topic]
-    pub id: u32,
-    #[topic]
-    pub buyer: Address,
-    #[topic]
-    pub farmer: Address,
-    pub token: Address,
-    pub amount: i128,
-}
-
-#[contractevent]
-pub struct OrderConfirmed {
-    #[topic]
-    pub id: u32,
-}
-
-#[contractevent]
-pub struct OrderRefunded {
-    #[topic]
-    pub id: u32,
 }
 
 #[contracttype]
