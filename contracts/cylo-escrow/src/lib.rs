@@ -1,7 +1,13 @@
 #![no_std]
 
-use soroban_sdk::{Address, Env, String, Symbol, Vec, contract, contracterror, contractimpl, contracttype, symbol_short, xdr::Error};
+use soroban_sdk::{
+    contract, contractevent, contracterror, contractimpl, contracttype, Address,
+    Env, String, Vec,
+};
 
+use soroban_sdk::token::TokenClient;
+
+/// Expiration window in seconds (96 hours)
 pub const EXPIRATION_PERIOD: u64 = 96 * 60 * 60;
 
 #[contract]
@@ -10,13 +16,24 @@ pub struct CyloEscrow;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    Farmer,
+    Admin,         // Admin data
+    LastOrderId,   // monotonic counter (u32)
+    Order(u32),    // order storage: Order id -> Order
+    BuyerOrders,   // mapping key prefix for buyer orders (use tuple (DataKey::BuyerOrders, Address))
+    FarmerOrders,  // mapping key prefix for farmer orders (use tuple (DataKey::FarmerOrders, Address))
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum CyloEscrowErrors {
     AlreadyInitialized = 1,
+    NotInitialized = 2,
+    InvalidOrderId = 3,
+    Unauthorized = 4,
+    InvalidInput = 5,
+    TransferFailed = 6,
+    AlreadyProcessed = 7,
+    NotExpired = 8,
 }
 
 #[contracttype]
@@ -30,7 +47,6 @@ pub struct Order {
     pub timestamp: u64,
     pub confirmed: bool,
     pub refunded: bool,
-    pub expired: bool,
     pub metadata: String,
 }
 
@@ -43,160 +59,325 @@ pub struct OrderStatus {
     pub time_remaining: u64,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EscrowEvent {
-    OrderCreated(u32, Address, Address, i128),
-    OrderConfirmed(u32),
-    OrderRefunded(u32),
-    OrderExpired(u32),
+#[contractevent]
+pub struct ContractInitialized {
+    #[topic]
+    pub timestamp: u64,
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent]
+pub struct OrderCreated {
+    #[topic]
+    pub id: u32,
+    #[topic]
+    pub buyer: Address,
+    #[topic]
+    pub farmer: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct OrderConfirmed {
+    #[topic]
+    pub id: u32,
+}
+
+#[contractevent]
+pub struct OrderRefunded {
+    #[topic]
+    pub id: u32,
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminData {
     pub admin: Address,
     pub initialized: bool,
 }
 
+impl CyloEscrow {
+    // --- Internal storage helpers ---
 
-type CyloEscrowResult<T> = Result<T, CyloEscrowErrors>;
+    fn set_admin(env: &Env, admin: &Address) {
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &AdminData { admin: admin.clone(), initialized: true });
+    }
 
-pub struct Storage;
+    fn admin(env: &Env) -> Option<AdminData> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
 
-// impl Storage {
-    // ========== ADMIN STORAGE ==========
-//     const ADMIN_KEY= "Admin";
+    fn next_order_id(env: &Env) -> u32 {
+        let last: u32 = env.storage().instance().get(&DataKey::LastOrderId).unwrap_or(0u32);
+        let next = last.saturating_add(1);
+        env.storage().instance().set(&DataKey::LastOrderId, &next);
+        next
+    }
 
-//     pub fn get_admin(env: &Env) -> Option<AdminData> {
-//         env.storage().persistent().get(&symbol_short!(DataKey::Farmer))
-//     }
+    fn last_order_id(env: &Env) -> u32 {
+        env.storage().instance().get(&DataKey::LastOrderId).unwrap_or(0u32)
+    }
 
-//     pub fn set_admin(env: &Env, admin_data: &AdminData) {
-//         env.storage().persistent().set(&symbol_short!(Self::ADMIN_KEY), admin_data);
-//     }
+    fn save_order(env: &Env, order: &Order) {
+        env.storage().instance().set(&DataKey::Order(order.id), order);
+    }
 
-//     pub fn require_admin(env: &Env, caller: &Address) {
-//         if let Some(admin_data) = Self::get_admin(env) {
-//             if &admin_data.admin != caller {
-//                 env.throw_error(EscrowError::Unauthorized);
-//             }
-//         } else {
-//             env.throw_error(EscrowError::NotInitialized);
-//         }
-//     }
+    fn load_order(env: &Env, id: u32) -> Option<Order> {
+        env.storage().instance().get(&DataKey::Order(id))
+    }
 
-//     // ========== ORDER STORAGE ==========
-//     const ORDER_COUNT_KEY: &'static str = "OrderCount";
-//     const ORDER_PREFIX: &'static str = "Order";
-//     const BUYER_ORDERS_PREFIX: &'static str = "BuyerOrders";
-//     const FARMER_ORDERS_PREFIX: &'static str = "FarmerOrders";
-//     const ACTIVE_ORDERS_KEY: &'static str = "ActiveOrders";
+    // We store buyer/farmer order lists directly under DataKey variants.
+    // Helper functions removed; callers should use DataKey::BuyerOrders(...) and DataKey::FarmerOrders(...).
 
-//     pub fn get_next_order_id(env: &Env) -> u32 {
-//         let current_count: u32 = env.storage().persistent()
-//             .get(&symbol_short!(Self::ORDER_COUNT_KEY))
-//             .unwrap_or(0);
-//         let next_id = current_count + 1;
-//         env.storage().persistent()
-//             .set(&symbol_short!(Self::ORDER_COUNT_KEY), &next_id);
-//         next_id
-//     }
+    fn add_buyer_order(env: &Env, buyer: &Address, id: u32) {
+        // store under composite key: (DataKey::BuyerOrders, buyer)
+        let key = (DataKey::BuyerOrders, buyer.clone());
+        let mut list: Vec<u32> = env.storage().instance().get(&key).unwrap_or_else(|| Vec::new(env));
+        list.push_back(id);
+        env.storage().instance().set(&key, &list);
+    }
 
-//     pub fn get_last_order_id(env: &Env) -> u32 {
-//         env.storage().persistent()
-//             .get(&symbol_short!(Self::ORDER_COUNT_KEY))
-//             .unwrap_or(0)
-//     }
+    fn get_buyer_orders_internal(env: &Env, buyer: &Address) -> Vec<u32> {
+        // retrieve list stored under composite key: (DataKey::BuyerOrders, buyer)
+        let key = (DataKey::BuyerOrders, buyer.clone());
+        env.storage().instance().get(&key).unwrap_or_else(|| Vec::new(env))
+    }
 
-//     pub fn save_order(env: &Env, order_id: u32, order: &Order) {
-//         let key = (symbol_short!(Self::ORDER_PREFIX), order_id);
-//         env.storage().persistent().set(&key, order);
+    fn add_farmer_order(env: &Env, farmer: &Address, id: u32) {
+        // store under composite key: (DataKey::FarmerOrders, farmer)
+        let key = (DataKey::FarmerOrders, farmer.clone());
+        let mut list: Vec<u32> = env.storage().instance().get(&key).unwrap_or_else(|| Vec::new(env));
+        list.push_back(id);
+        env.storage().instance().set(&key, &list);
+    }
 
-//         // Add to active orders if not completed
-//         if !order.confirmed && !order.refunded {
-//             Self::add_to_active_orders(env, order_id);
-//         } else {
-//             Self::remove_from_active_orders(env, order_id);
-//         }
-//     }
+    fn get_farmer_orders_internal(env: &Env, farmer: &Address) -> Vec<u32> {
+        // retrieve list stored under composite key: (DataKey::FarmerOrders, farmer)
+        let key = (DataKey::FarmerOrders, farmer.clone());
+        env.storage().instance().get(&key).unwrap_or_else(|| Vec::new(env))
+    }
 
-//     pub fn get_order(env: &Env, order_id: u32) -> Option<Order> {
-//         let key = (symbol_short!(Self::ORDER_PREFIX), order_id);
-//         env.storage().persistent().get(&key)
-//     }
+    // refund single order helper; returns Ok(true) if refunded, Ok(false) if skipped (not expired or already processed)
+    fn refund_if_expired(env: &Env, id: u32) -> Result<bool, CyloEscrowErrors> {
+        let mut order = match Self::load_order(env, id) {
+            Some(o) => o,
+            None => return Err(CyloEscrowErrors::InvalidOrderId),
+        };
 
-//     pub fn require_order(env: &Env, order_id: u32) -> Order {
-//         Self::get_order(env, order_id)
-//             .unwrap_or_else(|| env.throw_error(EscrowError::OrderNotFound))
-//     }
+        if order.refunded || order.confirmed {
+            return Ok(false);
+        }
 
-//     // ========== USER ORDER MAPPINGS ==========
-//     pub fn add_order_to_buyer(env: &Env, buyer: &Address, order_id: u32) {
-//         let key = (symbol_short!(Self::BUYER_ORDERS_PREFIX), buyer);
-//         let mut orders: Vec<u32> = env.storage().persistent()
-//             .get(&key)
-//             .unwrap_or_else(|| Vec::new(env));
-//         orders.push_back(order_id);
-//         env.storage().persistent().set(&key, &orders);
-//     }
+        let now = env.ledger().timestamp();
+        let expiry = order.timestamp.saturating_add(EXPIRATION_PERIOD);
+        if now < expiry {
+            return Ok(false);
+        }
 
-//     pub fn get_buyer_orders(env: &Env, buyer: &Address) -> Vec<u32> {
-//         let key = (symbol_short!(Self::BUYER_ORDERS_PREFIX), buyer);
-//         env.storage().persistent()
-//             .get(&key)
-//             .unwrap_or_else(|| Vec::new(env))
-//     }
+        // mark state first
+        order.refunded = true;
+        save_order_internal(env, &order);
 
-//     pub fn add_order_to_farmer(env: &Env, farmer: &Address, order_id: u32) {
-//         let key = (symbol_short!(Self::FARMER_ORDERS_PREFIX), farmer);
-//         let mut orders: Vec<u32> = env.storage().persistent()
-//             .get(&key)
-//             .unwrap_or_else(|| Vec::new(env));
-//         orders.push_back(order_id);
-//         env.storage().persistent().set(&key, &orders);
-//     }
+        // transfer tokens back to buyer (contract -> buyer)
+        let client = TokenClient::new(env, &order.token);
+        let contract_addr = env.current_contract_address();
+        client
+            .try_transfer(&contract_addr, &order.buyer, &order.amount)
+            .map_err(|_| CyloEscrowErrors::TransferFailed)?;
 
-//     pub fn get_farmer_orders(env: &Env, farmer: &Address) -> Vec<u32> {
-//         let key = (symbol_short!(Self::FARMER_ORDERS_PREFIX), farmer);
-//         env.storage().persistent()
-//             .get(&key)
-//             .unwrap_or_else(|| Vec::new(env))
-//     }
+        OrderRefunded { id }.publish(env);
 
-//     // ========== ACTIVE ORDERS MANAGEMENT ==========
-//     fn add_to_active_orders(env: &Env, order_id: u32) {
-//         let key = symbol_short!(Self::ACTIVE_ORDERS_KEY);
-//         let mut active_orders: Vec<u32> = env.storage().persistent()
-//             .get(&key)
-//             .unwrap_or_else(|| Vec::new(env));
-        
-//         if !active_orders.contains(&order_id) {
-//             active_orders.push_back(order_id);
-//             env.storage().persistent().set(&key, &active_orders);
-//         }
-//     }
+        Ok(true)
+    }
+}
 
-//     fn remove_from_active_orders(env: &Env, order_id: u32) {
-//         let key = symbol_short!(Self::ACTIVE_ORDERS_KEY);
-//         if let Some(mut active_orders) = env.storage().persistent().get::<Vec<u32>>(&key) {
-//             let mut new_orders = Vec::new(env);
-//             for id in active_orders.iter() {
-//                 if id != order_id {
-//                     new_orders.push_back(id);
-//                 }
-//             }
-//             env.storage().persistent().set(&key, &new_orders);
-//         }
-//     }
+// Helper to call save_order from nested functions (avoid borrow checker around impl block)
+fn save_order_internal(env: &Env, order: &Order) {
+    env.storage().instance().set(&DataKey::Order(order.id), order);
+}
 
-//     pub fn get_active_orders(env: &Env) -> Vec<u32> {
-//         let key = symbol_short!(Self::ACTIVE_ORDERS_KEY);
-//         env.storage().persistent()
-//             .get(&key)
-//             .unwrap_or_else(|| Vec::new(env))
-//     }
-// }
 #[contractimpl]
 impl CyloEscrow {
-    
+    /// Initialize contract with an admin (must authorize).
+    pub fn __init(env: &Env, admin: Address) -> Result<(), CyloEscrowErrors> {
+        admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(CyloEscrowErrors::AlreadyInitialized);
+        }
+        // set admin and init counter
+        Self::set_admin(env, &admin);
+        env.storage().instance().set(&DataKey::LastOrderId, &0u32);
+        ContractInitialized { timestamp: env.ledger().timestamp(), admin }.publish(env);
+        Ok(())
+    }
+
+    /// create_order: buyer calls to create an order and lock tokens.
+    /// Buyer address is provided and must `require_auth()`. This pattern makes
+    /// caller explicit and avoids implicit assumptions about invoker.
+    /// Returns the new order id.
+    pub fn create_order(
+        env: &Env,
+        buyer: Address,
+        farmer: Address,
+        token: Address,
+        amount: i128,
+        metadata: String,
+    ) -> Result<u32, CyloEscrowErrors> {
+        // ensure buyer authorized this action
+        buyer.require_auth();
+
+        // input validation
+        if amount <= 0 {
+            return Err(CyloEscrowErrors::InvalidInput);
+        }
+        if buyer == farmer {
+            return Err(CyloEscrowErrors::InvalidInput);
+        }
+
+        // Pull tokens from buyer into this contract.
+        // Use TokenClient::try_transfer(from, to, amount). This requires the `from` signer.
+        let token_client = TokenClient::new(env, &token);
+        let contract_addr = env.current_contract_address();
+        token_client
+            .try_transfer(&buyer, &contract_addr, &amount)
+            .map_err(|_| CyloEscrowErrors::TransferFailed)?;
+
+        // Create and persist order
+        let id = Self::next_order_id(env);
+        let now = env.ledger().timestamp();
+        let order = Order {
+            id,
+            buyer: buyer.clone(),
+            farmer: farmer.clone(),
+            token: token.clone(),
+            amount,
+            timestamp: now,
+            confirmed: false,
+            refunded: false,
+            metadata,
+        };
+
+        save_order_internal(env, &order);
+        Self::add_buyer_order(env, &buyer, id);
+        Self::add_farmer_order(env, &farmer, id);
+
+        OrderCreated { id, buyer, farmer, token, amount }.publish(env);
+
+        Ok(id)
+    }
+
+    /// confirm_receipt: buyer confirms the order and funds are transferred to farmer.
+    /// Buyer must authorize the call and must match the order buyer.
+    pub fn confirm_receipt(env: &Env, buyer: Address, order_id: u32) -> Result<(), CyloEscrowErrors> {
+        buyer.require_auth();
+
+        let mut order = match Self::load_order(env, order_id) {
+            Some(o) => o,
+            None => return Err(CyloEscrowErrors::InvalidOrderId),
+        };
+
+        if order.refunded || order.confirmed {
+            return Err(CyloEscrowErrors::AlreadyProcessed);
+        }
+
+        if order.buyer != buyer {
+            return Err(CyloEscrowErrors::Unauthorized);
+        }
+
+        // mark confirmed before transferring (checks-effects-interactions)
+        order.confirmed = true;
+        save_order_internal(env, &order);
+
+        let token_client = TokenClient::new(env, &order.token);
+        let contract_addr = env.current_contract_address();
+        token_client
+            .try_transfer(&contract_addr, &order.farmer, &order.amount)
+            .map_err(|_| CyloEscrowErrors::TransferFailed)?;
+
+        OrderConfirmed { id: order_id }.publish(env);
+
+        Ok(())
+    }
+
+    /// refund_order: refund a single expired order back to buyer. Anyone can call.
+    pub fn refund_order(env: &Env, order_id: u32) -> Result<(), CyloEscrowErrors> {
+        match CyloEscrow::refund_if_expired(env, order_id) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CyloEscrowErrors::NotExpired),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// refund_expired_orders: batched processor for expired orders.
+    /// Processes up to `limit` orders starting from `start_id` inclusive.
+    /// Returns number processed.
+    pub fn refund_expired_orders(env: &Env, start_id: u32, limit: u32) -> Result<u32, CyloEscrowErrors> {
+        let last = Self::last_order_id(env);
+        if last == 0 || start_id > last || limit == 0 {
+            return Ok(0);
+        }
+
+        let mut processed: u32 = 0;
+        let mut i = start_id;
+        let end = if start_id.saturating_add(limit.saturating_sub(1)) > last {
+            last
+        } else {
+            start_id.saturating_add(limit.saturating_sub(1))
+        };
+
+        while i <= end {
+            if let Ok(refunded) = CyloEscrow::refund_if_expired(env, i) {
+                if refunded {
+                    processed = processed.saturating_add(1);
+                }
+            }
+            i = i.saturating_add(1);
+        }
+        Ok(processed)
+    }
+
+    /// get_orders_by_buyer: returns list of order IDs associated with buyer
+    pub fn get_orders_by_buyer(env: &Env, buyer: Address) -> Vec<u32> {
+        Self::get_buyer_orders_internal(env, &buyer)
+    }
+
+    /// get_orders_by_farmer: returns list of order IDs associated with farmer
+    pub fn get_orders_by_farmer(env: &Env, farmer: Address) -> Vec<u32> {
+        Self::get_farmer_orders_internal(env, &farmer)
+    }
+
+    /// get_order_details: returns Order struct for the given id
+    pub fn get_order_details(env: &Env, order_id: u32) -> Result<Order, CyloEscrowErrors> {
+        match Self::load_order(env, order_id) {
+            Some(o) => Ok(o),
+            None => Err(CyloEscrowErrors::InvalidOrderId),
+        }
+    }
+
+    /// get_order_status: helper read-only summary
+    pub fn get_order_status(env: &Env, order_id: u32) -> Result<OrderStatus, CyloEscrowErrors> {
+        let order = match Self::load_order(env, order_id) {
+            Some(o) => o,
+            None => return Err(CyloEscrowErrors::InvalidOrderId),
+        };
+
+        let now = env.ledger().timestamp();
+        let expiry = order.timestamp.saturating_add(EXPIRATION_PERIOD);
+        let (is_expired, time_remaining) = if now >= expiry {
+            (true, 0u64)
+        } else {
+            (false, expiry.saturating_sub(now))
+        };
+
+        Ok(OrderStatus {
+            is_confirmed: order.confirmed,
+            is_refunded: order.refunded,
+            is_expired: is_expired,
+            time_remaining,
+        })
+    }
 }
