@@ -8,7 +8,9 @@ publish = false
 version.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+name = "cylo_escrow"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
@@ -18,3 +20,4 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+
